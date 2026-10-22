@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: bim-addin-store
+    runtime: python
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      # Persist the SQLite database and uploaded packages across deployments.
+      - key: BIMDEPLOY_HOME
+        value: /var/data
+      # Set these values in Render's dashboard; never commit the real secrets.
+      - key: BIMDEPLOY_ADMIN_TOKEN
+        sync: false
+      - key: BIMDEPLOY_ENROLLMENT_TOKEN
+        sync: false
+      - key: BIMDEPLOY_DEVICE_TOKEN
+        sync: false
+    disk:
+      name: bim-addin-store-data
+      mountPath: /var/data
+      sizeGB: 1
