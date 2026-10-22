@@ -12,6 +12,13 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # PostgreSQL is optional for local SQLite deployments.
+    psycopg = None
+    dict_row = None
+
 CODE_ROOT = Path(__file__).resolve().parent
 
 
@@ -28,6 +35,10 @@ def _load_env_file(path: Path) -> None:
 
 
 _load_env_file(CODE_ROOT / ".env")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USING_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+if USING_POSTGRES and psycopg is None:
+    raise RuntimeError("DATABASE_URL is configured but psycopg is not installed. Run pip install -r requirements.txt.")
 ROOT = Path(os.getenv("BIMDEPLOY_HOME", CODE_ROOT))
 DATA = ROOT / "data"
 PKG_DIR = DATA / "packages"
@@ -39,12 +50,36 @@ MAX_UPLOAD = int(os.getenv("BIMDEPLOY_MAX_UPLOAD_BYTES", str(500 * 1024 * 1024))
 SESSION_TTL = 8 * 60 * 60
 LOGIN_FAILS: dict[str, list[float]] = {}
 STATIC_DIR = CODE_ROOT / "static"
-DATA.mkdir(parents=True, exist_ok=True); PKG_DIR.mkdir(parents=True, exist_ok=True)
+# Render's source filesystem is read-only/ephemeral. When DATABASE_URL is set,
+# all mutable state, including uploaded ZIPs, is stored in PostgreSQL instead.
+if not USING_POSTGRES:
+    DATA.mkdir(parents=True, exist_ok=True); PKG_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="BIM Add-in Store", version="1.0.0")
 app.mount("/static", StaticFiles(directory=CODE_ROOT / "static"), name="static")
 
 
+class PostgresConnection:
+    """Small compatibility wrapper for the existing SQLite-style queries."""
+    def __init__(self):
+        self.connection = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+    def execute(self, statement: str, params=()):
+        # Application SQL consistently uses qmark parameters; psycopg uses %s.
+        return self.connection.execute(statement.replace("?", "%s"), params)
+
+    def executescript(self, script: str):
+        for statement in script.split(";"):
+            if statement.strip(): self.execute(statement)
+
+    def __enter__(self): return self
+
+    def __exit__(self, exc_type, exc, _tb):
+        try: self.connection.rollback() if exc_type else self.connection.commit()
+        finally: self.connection.close()
+
+
 def db():
+    if USING_POSTGRES: return PostgresConnection()
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
@@ -53,16 +88,18 @@ def db():
 
 def init_db():
     with db() as c:
-        c.executescript('''
+        event_id = "BIGSERIAL PRIMARY KEY" if USING_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        package_blob_type = "BYTEA" if USING_POSTGRES else "BLOB"
+        c.executescript(f'''
         CREATE TABLE IF NOT EXISTS devices(
           id TEXT PRIMARY KEY, hostname TEXT NOT NULL, machine_id TEXT NOT NULL UNIQUE,
           agent_version TEXT, revit_versions TEXT NOT NULL DEFAULT '[]', groups_json TEXT NOT NULL DEFAULT '[]',
           last_seen INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'online'
         );
         CREATE TABLE IF NOT EXISTS packages(
-          id TEXT PRIMARY KEY, addon_id TEXT NOT NULL, version TEXT NOT NULL, package_file TEXT NOT NULL,
+          id TEXT PRIMARY KEY, addon_id TEXT NOT NULL, version TEXT NOT NULL, package_file TEXT NOT NULL DEFAULT '',
           sha256 TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at INTEGER NOT NULL,
-          UNIQUE(addon_id, version)
+          package_blob {package_blob_type}, UNIQUE(addon_id, version)
         );
         CREATE TABLE IF NOT EXISTS assignments(
           id TEXT PRIMARY KEY, addon_id TEXT NOT NULL, version TEXT NOT NULL, target_group TEXT NOT NULL DEFAULT '*',
@@ -74,7 +111,7 @@ def init_db():
           UNIQUE(device_id, package_id)
         );
         CREATE TABLE IF NOT EXISTS events(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, device_id TEXT, event_type TEXT NOT NULL, details TEXT NOT NULL
+          id {event_id}, ts INTEGER NOT NULL, device_id TEXT, event_type TEXT NOT NULL, details TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS users(
           username TEXT PRIMARY KEY, password_salt TEXT NOT NULL, password_hash TEXT NOT NULL,
@@ -89,10 +126,17 @@ def init_db():
           FOREIGN KEY(username) REFERENCES users(username)
         );
         ''')
-        cols = {r[1] for r in c.execute("PRAGMA table_info(packages)")}
-        if "revoked" not in cols: c.execute("ALTER TABLE packages ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0")
-        if "release_notes" not in cols: c.execute("ALTER TABLE packages ADD COLUMN release_notes TEXT NOT NULL DEFAULT ''")
-        if "uploaded_by" not in cols: c.execute("ALTER TABLE packages ADD COLUMN uploaded_by TEXT NOT NULL DEFAULT ''")
+        if USING_POSTGRES:
+            c.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS revoked INTEGER NOT NULL DEFAULT 0")
+            c.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS release_notes TEXT NOT NULL DEFAULT ''")
+            c.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS uploaded_by TEXT NOT NULL DEFAULT ''")
+            c.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS package_blob BYTEA")
+        else:
+            cols = {r[1] for r in c.execute("PRAGMA table_info(packages)")}
+            if "revoked" not in cols: c.execute("ALTER TABLE packages ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0")
+            if "release_notes" not in cols: c.execute("ALTER TABLE packages ADD COLUMN release_notes TEXT NOT NULL DEFAULT ''")
+            if "uploaded_by" not in cols: c.execute("ALTER TABLE packages ADD COLUMN uploaded_by TEXT NOT NULL DEFAULT ''")
+            if "package_blob" not in cols: c.execute("ALTER TABLE packages ADD COLUMN package_blob BLOB")
         c.execute("CREATE TABLE IF NOT EXISTS install_tokens(token_hash TEXT PRIMARY KEY, package_id TEXT NOT NULL, username TEXT NOT NULL, expires_at INTEGER NOT NULL)")
         c.execute("DELETE FROM install_tokens WHERE expires_at < ?", (int(time.time()),))
         # expire stale sessions and mark old devices offline
@@ -207,7 +251,7 @@ class DeployRequest(BaseModel):
 def health():
     # Do not include secrets here.  The storage path is useful when diagnosing
     # accidental use of a temporary/different deployment directory.
-    return {"status": "ok", "service": "BIM Add-in Store", "time": int(time.time()), "storage": str(DATA)}
+    return {"status": "ok", "service": "BIM Add-in Store", "time": int(time.time()), "storage": "postgresql" if USING_POSTGRES else str(DATA)}
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -331,14 +375,18 @@ async def upload_package(admin: str = Depends(require_admin), file: UploadFile =
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", str(addon_id)): raise HTTPException(400, "Invalid add-in ID")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,49}", str(version)): raise HTTPException(400, "Invalid version")
     sha = hashlib.sha256(content).hexdigest(); package_id = str(uuid.uuid4()); safe_name = f"{package_id}.zip"; path = PKG_DIR / safe_name
-    path.write_bytes(content); now = int(time.time())
+    if not USING_POSTGRES: path.write_bytes(content)
+    now = int(time.time())
     try:
         with db() as c:
-            c.execute("INSERT INTO packages(id,addon_id,version,package_file,sha256,manifest_json,created_at,release_notes,uploaded_by) VALUES(?,?,?,?,?,?,?,?,?)",
-                      (package_id, addon_id, version, safe_name, sha, json.dumps(manifest), now, release_notes[:4000], admin))
+            c.execute("INSERT INTO packages(id,addon_id,version,package_file,sha256,manifest_json,created_at,release_notes,uploaded_by,package_blob) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (package_id, addon_id, version, safe_name, sha, json.dumps(manifest), now, release_notes[:4000], admin, content if USING_POSTGRES else None))
             c.execute("INSERT INTO events(ts,event_type,details) VALUES(?,?,?)", (now, "package_published", json.dumps({"addon_id": addon_id, "version": version, "sha256": sha, "by": admin})))
-    except sqlite3.IntegrityError:
-        path.unlink(missing_ok=True); raise HTTPException(409, "This add-in version already exists")
+    except Exception as exc:
+        if isinstance(exc, sqlite3.IntegrityError) or (psycopg is not None and isinstance(exc, psycopg.IntegrityError)):
+            if not USING_POSTGRES: path.unlink(missing_ok=True)
+            raise HTTPException(409, "This add-in version already exists") from exc
+        raise
     return {"package_id": package_id, "addon_id": addon_id, "version": version, "sha256": sha, "supportedRevitVersions": manifest["supportedRevitVersions"]}
 
 @app.post("/api/admin/packages/{package_id}/revoke")
@@ -394,7 +442,7 @@ def create_assignment(req: AssignmentRequest):
 @app.get("/api/portal/catalog")
 def catalog(user: dict = Depends(current_user)):
     with db() as c:
-        rows = c.execute("SELECT id,addon_id,version,sha256,manifest_json,created_at,release_notes FROM packages WHERE revoked=0 ORDER BY addon_id,created_at DESC,rowid DESC").fetchall()
+        rows = c.execute("SELECT id,addon_id,version,sha256,manifest_json,created_at,release_notes FROM packages WHERE revoked=0 ORDER BY addon_id,created_at DESC,id DESC").fetchall()
         if user["role"] == "admin": devices = c.execute("SELECT id,hostname,revit_versions,status,last_seen FROM devices ORDER BY hostname").fetchall()
         else: devices = c.execute('''SELECT d.id,d.hostname,d.revit_versions,d.status,d.last_seen FROM devices d
           JOIN user_devices ud ON ud.device_id=d.id WHERE ud.username=? ORDER BY ud.is_primary DESC,d.hostname''', (user["username"],)).fetchall()
@@ -414,26 +462,38 @@ def catalog(user: dict = Depends(current_user)):
 
 def _pkg_for_download(package_id: str, user: dict):
     with db() as c:
-        row = c.execute("SELECT package_file,addon_id,version,revoked FROM packages WHERE id=?", (package_id,)).fetchone()
+        row = c.execute("SELECT package_file,package_blob,addon_id,version,revoked FROM packages WHERE id=?", (package_id,)).fetchone()
         if not row or (row["revoked"] and user["role"] != "admin"): raise HTTPException(404, "Approved package not found")
         c.execute("INSERT INTO events(ts,event_type,details) VALUES(?,?,?)", (int(time.time()), "package_downloaded", json.dumps({"addon_id": row["addon_id"], "version": row["version"], "by": user["username"]})))
+    if USING_POSTGRES:
+        if row["package_blob"] is None: raise HTTPException(404, "Package content missing")
+        return row, bytes(row["package_blob"])
     path = PKG_DIR / row["package_file"]
     if not path.is_file(): raise HTTPException(404, "Package file missing")
     return row, path
 
+
+def package_response(content: Path | bytes, filename: str, headers: Optional[dict[str, str]] = None):
+    headers = headers or {}
+    if isinstance(content, Path):
+        return FileResponse(content, filename=filename, media_type="application/zip", headers=headers)
+    headers = {**headers, "Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content, media_type="application/zip", headers=headers)
+
 @app.get("/api/portal/packages/{package_id}/download")
 def portal_download_package(package_id: str, user: dict = Depends(current_user)):
     """Authenticated ZIP download. A browser cannot write into Revit folders; the local installer does that."""
-    row, path = _pkg_for_download(package_id, user)
-    return FileResponse(path, filename=re.sub(r"[^A-Za-z0-9._-]", "_", f"{row['addon_id']}-{row['version']}.zip"), media_type="application/zip")
+    row, content = _pkg_for_download(package_id, user)
+    return package_response(content, re.sub(r"[^A-Za-z0-9._-]", "_", f"{row['addon_id']}-{row['version']}.zip"))
 
 @app.get("/api/portal/packages/{package_id}/bundle")
 def portal_download_bundle(package_id: str, user: dict = Depends(current_user)):
     """One-click bundle: package.zip + installer + Install.bat. Extract, double-click Install.bat."""
-    row, path = _pkg_for_download(package_id, user)
+    row, content = _pkg_for_download(package_id, user)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.write(path, "package.zip")
+        if isinstance(content, Path): z.write(content, "package.zip")
+        else: z.writestr("package.zip", content)
         z.write(STATIC_DIR / "Install-BIMAddinPackage.ps1", "Install-BIMAddinPackage.ps1")
         z.write(STATIC_DIR / "Install.bat", "Install.bat")
     name = re.sub(r"[^A-Za-z0-9._-]", "_", f"{row['addon_id']}-{row['version']}-installer.zip")
@@ -458,12 +518,15 @@ def install_download(package_id: str, token: str):
     with db() as c:
         t = c.execute("SELECT package_id,username,expires_at FROM install_tokens WHERE token_hash=?", (key,)).fetchone()
         if not t or t["package_id"] != package_id or t["expires_at"] < int(time.time()): raise HTTPException(401, "Install token invalid or expired. Click Install now again.")
-        row = c.execute("SELECT package_file,sha256,addon_id,version,revoked FROM packages WHERE id=?", (package_id,)).fetchone()
+        row = c.execute("SELECT package_file,package_blob,sha256,addon_id,version,revoked FROM packages WHERE id=?", (package_id,)).fetchone()
         if not row or row["revoked"]: raise HTTPException(404, "Package not available")
         c.execute("INSERT INTO events(ts,event_type,details) VALUES(?,?,?)", (int(time.time()), "package_downloaded", json.dumps({"addon_id": row["addon_id"], "version": row["version"], "by": t["username"], "via": "helper"})))
+    if USING_POSTGRES:
+        if row["package_blob"] is None: raise HTTPException(404, "Package content missing")
+        return package_response(bytes(row["package_blob"]), f"{package_id}.zip", {"X-Package-SHA256": row["sha256"]})
     path = PKG_DIR / row["package_file"]
     if not path.is_file(): raise HTTPException(404, "Package file missing")
-    return FileResponse(path, media_type="application/zip", filename=f"{package_id}.zip", headers={"X-Package-SHA256": row["sha256"]})
+    return package_response(path, f"{package_id}.zip", {"X-Package-SHA256": row["sha256"]})
 
 @app.get("/api/portal/setup-bundle")
 def setup_bundle(request: Request, user: dict = Depends(current_user)):
@@ -508,11 +571,14 @@ def get_jobs(x_device_id: str = Header(...), _: None = Depends(require_device)):
 @app.get("/api/packages/{package_id}/download")
 def download_package(package_id: str, x_device_id: str = Header(...), _: None = Depends(require_device)):
     with db() as c:
-        row=c.execute("SELECT p.package_file FROM packages p JOIN jobs j ON j.package_id=p.id WHERE p.id=? AND j.device_id=? AND j.status IN ('downloading','queued','retry','deferred')",(package_id,x_device_id)).fetchone()
+        row=c.execute("SELECT p.package_file,p.package_blob FROM packages p JOIN jobs j ON j.package_id=p.id WHERE p.id=? AND j.device_id=? AND j.status IN ('downloading','queued','retry','deferred')",(package_id,x_device_id)).fetchone()
     if not row: raise HTTPException(404,"Package is not assigned to this device")
+    if USING_POSTGRES:
+        if row["package_blob"] is None: raise HTTPException(404,"Package content missing")
+        return package_response(bytes(row["package_blob"]), f"{package_id}.zip")
     path=PKG_DIR / row["package_file"]
     if not path.is_file(): raise HTTPException(404,"Package file missing")
-    return FileResponse(path, filename=f"{package_id}.zip", media_type="application/zip")
+    return package_response(path, f"{package_id}.zip")
 
 @app.post("/api/jobs/{job_id}/report")
 def report_job(job_id: str, req: JobReport, x_device_id: str = Header(...), _: None = Depends(require_device)):
@@ -562,7 +628,7 @@ def assign_device(req: OwnershipRequest):
 def overview():
     with db() as c:
         devices=[dict(r) for r in c.execute("SELECT id,hostname,machine_id,agent_version,revit_versions,groups_json,last_seen,status FROM devices ORDER BY hostname").fetchall()]
-        packages=[dict(r) for r in c.execute("SELECT id,addon_id,version,sha256,created_at,manifest_json,revoked,release_notes,uploaded_by FROM packages ORDER BY created_at DESC,rowid DESC").fetchall()]
+        packages=[dict(r) for r in c.execute("SELECT id,addon_id,version,sha256,created_at,manifest_json,revoked,release_notes,uploaded_by FROM packages ORDER BY created_at DESC,id DESC").fetchall()]
         jobs=[dict(r) for r in c.execute("SELECT j.id,j.device_id,d.hostname,p.addon_id,p.version,j.status,j.created_at,j.updated_at,j.message FROM jobs j JOIN devices d ON d.id=j.device_id JOIN packages p ON p.id=j.package_id ORDER BY j.created_at DESC LIMIT 300").fetchall()]
         users=[dict(r) for r in c.execute("SELECT username,role,enabled,created_at FROM users ORDER BY username").fetchall()]
         owners=[dict(r) for r in c.execute("SELECT username,device_id,is_primary FROM user_devices").fetchall()]

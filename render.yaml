@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: bim-addin-store
+    runtime: python
+    plan: free
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      # All mutable data, including uploaded ZIPs, is stored in Render Postgres.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bim-addin-store-db
+          property: connectionString
+      # Set these values in Render's dashboard; never commit the real secrets.
+      - key: BIMDEPLOY_ADMIN_TOKEN
+        sync: false
+      - key: BIMDEPLOY_ENROLLMENT_TOKEN
+        sync: false
+      - key: BIMDEPLOY_DEVICE_TOKEN
+        sync: false
+databases:
+  - name: bim-addin-store-db
+    plan: free
+    databaseName: bimstore
+    user: bimstore
