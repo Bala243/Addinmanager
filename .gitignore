@@ -1,0 +1,16 @@
+server/.venv/
+server/data/*
+!server/data/.gitkeep
+server/__pycache__/
+server/*.pyc
+agent/agent-config.json
+*.log
+.env
+*.db
+data/
+.venv/
+__pycache__/
+dist/
+agent-config.json
+.test-tmp/
+.vs/

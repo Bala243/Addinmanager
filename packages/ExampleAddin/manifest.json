@@ -1,0 +1,9 @@
+{
+  "id": "BIM.ExampleAddin",
+  "version": "1.0.0",
+  "packageType": "RevitAddin",
+  "supportedRevitVersions": ["2025", "2026"],
+  "installScope": "machine",
+  "updatePolicy": "whenRevitClosed",
+  "description": "Example manifest only; replace with a real signed DLL package."
+}

@@ -1,0 +1,10 @@
+{
+  "serverUrl": "http://bimdeploy-server:8000",
+  "deviceToken": "REPLACE_WITH_BIMDEPLOY_DEVICE_TOKEN",
+  "enrollmentToken": "REPLACE_WITH_BIMDEPLOY_ENROLLMENT_TOKEN",
+  "groups": ["Pilot"],
+  "pollSeconds": 120,
+  "installRoot": "C:\\ProgramData\\BIMAddinDeployment\\Addins",
+  "statePath": "C:\\ProgramData\\BIMAddinDeployment\\state.json",
+  "logPath": "C:\\ProgramData\\BIMAddinDeployment\\agent.log"
+}
